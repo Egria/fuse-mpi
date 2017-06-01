@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <cerrno>
@@ -25,6 +26,8 @@
 #define PATH_MAX       4096*2
 #define MSIZE          2
 #define  ROOT          0
+#define BLOCK_SIZE     (128 * 1024)
+#define BLOCK_TABLE_GROW (1024 * 1024)
 
 
 /*............. Global Declarations .................*/
@@ -45,12 +48,31 @@ struct fsdata
 
 /* File information */
 
+union block
+{
+    uint8_t data[BLOCK_SIZE];
+    union block *next;
+};
+
+union block *block_continuous_pool;
+size_t block_continuous_pool_size;
+
+union block *block_free_chain;
+
+struct block_info
+{
+    union block *addr;
+};
+
 struct metadata
 {
 
     unsigned long inode;
     unsigned long size;
-    char *data;
+
+    block_info *blocks_table;
+    size_t blocks_table_size;
+
     mode_t mode;
     short inuse;
     time_t accesstime;
@@ -129,7 +151,9 @@ int fill_file_data(char *dirname, char *fname, mode_t mode)
 
     file[i].inode = i;
     file[i].size = 0;
-    file[i].data = NULL;
+    file[i].blocks_table_size = BLOCK_TABLE_GROW;
+    file[i].blocks_table = (block_info*)calloc(file[i].blocks_table_size,sizeof(union block *));
+//    file[i].data = NULL;
     file[i].inuse = 1;
 //    file[i].mode = S_IFREG | 0777;
     file[i].mode = S_IFREG | mode;
@@ -172,10 +196,10 @@ int fill_directory_data( char *dirname, char *fname, mode_t mode )
     }
 
     /* Fill the metadata info */
-
     file[i].inode = i;
     file[i].size = 0;
-    file[i].data = NULL;
+    file[i].blocks_table_size = BLOCK_TABLE_GROW;
+    file[i].blocks_table = (block_info*)calloc(file[i].blocks_table_size, sizeof(union block *));
     file[i].inuse = 1;
 //    file[i].mode = S_IFDIR | 0777;
     file[i].mode = S_IFDIR | mode;
@@ -223,7 +247,9 @@ static void *imfs_init(fuse_conn_info *conn)
 
     file [ROOT].inode = 0;
     file [ROOT].size = 0;
-    file [ROOT].data = NULL;
+    file [ROOT].blocks_table_size = BLOCK_TABLE_GROW;
+    file [ROOT].blocks_table=(block_info*)calloc(file[ROOT].blocks_table_size,sizeof(union block*));
+    //file [ROOT].data = NULL;
     file [ROOT].inuse = 1;
     file [ROOT].mode = S_IFDIR | 0777;
     file [ROOT].accesstime = time(NULL);
@@ -405,16 +431,35 @@ static int imfs_truncate(const char *path, off_t offset )
 
     if ( offset == 0 )
     {
-        free(file [iter->second].data);
-        file [iter->second].data = NULL;
+        int block_num=0;
+        for (block_num=0;block_num<file[iter->second].blocks_table_size;block_num++){
+            if (file[iter->second].blocks_table[block_num].addr!=NULL){
+                block* temp=file[iter->second].blocks_table[block_num].addr;
+                temp->next=block_free_chain;
+                block_free_chain=temp;
+                file[iter->second].blocks_table[block_num].addr=NULL;
+            }
+        }
+        free(file[iter->second].blocks_table);
+        //free(file [iter->second].data);
+        //file [iter->second].data = NULL;
         file [iter->second].size = 0;
         fs_stat.free_bytes = fs_stat.free_bytes + old_size ;
         fs_stat.used_bytes = fs_stat.used_bytes - old_size ;
     }
     else
-    {
-
-        file [iter->second].data = (char *) realloc( file[iter->second].data, offset + 1);
+    {   int block_num,blocks_table_size_new;
+        blocks_table_size_new=(offset+1)/BLOCK_SIZE;
+        if (blocks_table_size_new*BLOCK_SIZE<offset+1) blocks_table_size_new++;
+        for (block_num=blocks_table_size_new;block_num<file[iter->second].blocks_table_size;block_num++){
+            if (file[iter->second].blocks_table[block_num].addr!=NULL){
+                block* temp=file[iter->second].blocks_table[block_num].addr;
+                temp->next=block_free_chain;
+                block_free_chain=temp;
+                file[iter->second].blocks_table[block_num].addr=NULL;
+            }
+        }
+        //file [iter->second].data = (char *) realloc( file[iter->second].data, offset + 1);
         file [iter->second].size = offset + 1;
         fs_stat.free_bytes = fs_stat.free_bytes + old_size - offset + 1;
         fs_stat.used_bytes = fs_stat.used_bytes - old_size + offset + 1;
@@ -475,13 +520,60 @@ static int imfs_read(const char *path, char *buf, size_t size, off_t offset, fus
     if (S_ISDIR(file[iter->second].mode))
         return -EISDIR;
 
-    if ( file[iter->second].data != NULL  &&  ( offset < file[iter->second].size ) )
+    if (file[iter->second].blocks_table->addr!=NULL && (offset < file[iter->second].size))
+    {
+        if (offset+size>file[iter->second].size)
+        {
+            size=file[iter->second].size-offset;
+        }
+        int start_block_num,block_num,start_block_offset,finish_addr,copied;
+        start_block_num=offset/BLOCK_SIZE;
+        start_block_offset=offset%BLOCK_SIZE;
+        finish_addr=offset+size;
+        copied=0;
+        for (block_num=start_block_num;block_num<file[iter->second].blocks_table_size;block_num++)
+        {
+            if (block_num*BLOCK_SIZE==finish_addr){
+                break;
+            }
+            if (block_num==start_block_num)
+            {
+                if (start_block_offset+offset<BLOCK_SIZE)
+                {
+                    memcpy(buf,file[iter->second].blocks_table[block_num].addr->data+start_block_offset,offset);
+                    copied=offset;
+                    break;
+                }
+                else
+                {
+                    memcpy(buf,file[iter->second].blocks_table[block_num].addr->data+start_block_offset,BLOCK_SIZE-start_block_offset);
+                    copied=BLOCK_SIZE-start_block_offset;
+                }
+            }
+            else
+            {
+                if ((block_num+1)*BLOCK_SIZE>finish_addr)
+                {
+                    memcpy(buf+copied,file[iter->second].blocks_table[block_num].addr->data,finish_addr-(block_num+1)*BLOCK_SIZE);
+                    break;
+                }
+                else
+                {
+                    memcpy(buf+copied,file[iter->second].blocks_table[block_num].addr->data,BLOCK_SIZE);
+                    copied+=BLOCK_SIZE;
+                }
+            }
+
+        }
+
+    }
+    /*if ( file[iter->second].data != NULL  &&  ( offset < file[iter->second].size ) )
     {
         if (offset + size > file[iter->second].size )
             size = file[iter->second].size - offset;
 
         memcpy( buf, file[iter->second].data + offset, size );
-    }
+    }*/
     else
         size = 0;
     file[iter->second].accesstime = time(NULL);
@@ -500,7 +592,44 @@ int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fus
     if (S_ISDIR(file[iter->second].mode))
         return -EISDIR;
 
-    if ( file [iter->second].data == NULL )
+    if (file[iter->second].blocks_table->addr==NULL)
+    {
+        if (fs_stat.free_bytes<size) return -ENOSPC;
+        int blocks_table_size_new=(offset+size)/BLOCK_SIZE;
+        if (BLOCK_SIZE*blocks_table_size_new<(offset+size)) blocks_table_size_new++;
+        int block_num=0;
+        for (block_num=0;block_num<blocks_table_size_new;block_num++)
+        {
+            if (block_free_chain!=NULL)
+            {
+                file[iter->second].blocks_table[block_num].addr=block_free_chain;
+                block_free_chain=block_free_chain->next;
+                file[iter->second].blocks_table[block_num].addr->next=NULL;
+                memset(file[iter->second].blocks_table[block_num].addr->data,0,BLOCK_SIZE);
+            }
+            else
+            {
+                if (block_continuous_pool_size<=0)
+                {
+                    int block_pool_num=0;
+                    for (block_pool_num=0;block_pool_num<=BLOCK_TABLE_GROW;block_pool_num++)
+                    {
+                        block_continuous_pool[block_pool_num]=*(block*)malloc(BLOCK_SIZE);
+                    }
+                    block_continuous_pool_size=BLOCK_TABLE_GROW;
+                }
+                file[iter->second].blocks_table[block_num].addr=block_continuous_pool+(block_continuous_pool_size-1)*BLOCK_SIZE;
+                memset(file[iter->second].blocks_table[block_num].addr->data,0,BLOCK_SIZE);
+                block_continuous_pool_size--;
+            }
+        }
+        file[iter->second].size=offset+size;
+        fs_stat.free_bytes=fs_stat.free_bytes-(offset+size);
+        fs_stat.used_bytes=fs_stat.used_bytes+offset+size;
+
+
+    }
+/*    if ( file [iter->second].data == NULL )
     {
         if ( fs_stat.free_bytes < size )
             return -ENOSPC;
@@ -517,7 +646,7 @@ int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fus
         file [iter->second].size = offset + size;
         fs_stat.free_bytes = fs_stat.free_bytes - (offset + size);
         fs_stat.used_bytes = fs_stat.used_bytes + offset + size;
-    }
+    }*/
     else
     {
 
@@ -528,14 +657,85 @@ int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fus
             if ( fs_stat.free_bytes < ( offset + size - old_size ) )
                 return -ENOSPC;
 
-            file [iter->second].data = (char *) realloc( file[iter->second].data, (offset + size) );
+            int blocks_table_size_new=(offset+size)/BLOCK_SIZE;
+            if (BLOCK_SIZE*blocks_table_size_new<(offset+size)) blocks_table_size_new++;
+            int block_num=0;
+            for (block_num=0;block_num<blocks_table_size_new;block_num++)
+            {
+                if (file[iter->second].blocks_table[block_num].addr==NULL)
+                {
+                    if (block_free_chain!=NULL)
+                    {
+                        file[iter->second].blocks_table[block_num].addr=block_free_chain;
+                        block_free_chain=block_free_chain->next;
+                        file[iter->second].blocks_table[block_num].addr->next=NULL;
+                    }
+                    else
+                    {
+                        if (block_continuous_pool_size<=0)
+                        {
+                            int block_pool_num=0;
+                            for (block_pool_num=0;block_pool_num<=BLOCK_TABLE_GROW;block_pool_num++)
+                            {
+                                block_continuous_pool[block_pool_num]=*(block*)malloc(BLOCK_SIZE);
+                            }
+                            block_continuous_pool_size=BLOCK_TABLE_GROW;
+                        }
+                        file[iter->second].blocks_table[block_num].addr=block_continuous_pool+(block_continuous_pool_size-1)*BLOCK_SIZE;
+                        block_continuous_pool_size--;
+                    }
+                }
+                memset(file[iter->second].blocks_table[block_num].addr->data,0,BLOCK_SIZE);
+            }
+            //file [iter->second].data = (char *) realloc( file[iter->second].data, (offset + size) );
             fs_stat.free_bytes = fs_stat.free_bytes + old_size - ( offset + size );
             fs_stat.used_bytes = fs_stat.used_bytes - old_size + ( offset + size );
             file [iter->second].size = offset + size;
         }
     }
 
-    memcpy(file[iter->second].data + offset, buf, size);
+
+    int start_block_num,block_num,start_block_offset,finish_addr,copied;
+    start_block_num=offset/BLOCK_SIZE;
+    start_block_offset=offset%BLOCK_SIZE;
+    finish_addr=offset+size;
+    copied=0;
+    for (block_num=start_block_num;block_num<file[iter->second].blocks_table_size;block_num++)
+    {
+        if (block_num*BLOCK_SIZE==finish_addr){
+            break;
+        }
+        if (block_num==start_block_num)
+        {
+            if (start_block_offset+offset<BLOCK_SIZE)
+            {
+                memcpy(file[iter->second].blocks_table[block_num].addr->data+start_block_offset,buf,offset);
+                copied=offset;
+                break;
+            }
+            else
+            {
+                memcpy(file[iter->second].blocks_table[block_num].addr->data+start_block_offset,buf,BLOCK_SIZE-start_block_offset);
+                copied=BLOCK_SIZE-start_block_offset;
+            }
+        }
+        else
+        {
+            if ((block_num+1)*BLOCK_SIZE>finish_addr)
+            {
+                memcpy(file[iter->second].blocks_table[block_num].addr->data,buf+copied,finish_addr-(block_num+1)*BLOCK_SIZE);
+                break;
+            }
+            else
+            {
+                memcpy(file[iter->second].blocks_table[block_num].addr->data,buf+copied,BLOCK_SIZE);
+                copied+=BLOCK_SIZE;
+            }
+        }
+
+    }
+
+    //memcpy(file[iter->second].data + offset, buf, size);
     file[iter->second].accesstime = time(NULL);
     file[iter->second].modifiedtime = time(NULL);
     return size;
@@ -584,8 +784,21 @@ static int imfs_unlink(const char *path)
 
 
     file [iter->second].inuse = 0;
-    free(file [iter->second].data);
-    file [iter->second].data = NULL;
+    int block_num=0;
+    for (block_num=0;block_num<file[iter->second].blocks_table_size;block_num++){
+        if (file[iter->second].blocks_table[block_num].addr!=NULL){
+            block* temp=file[iter->second].blocks_table[block_num].addr;
+            temp->next=block_free_chain;
+            block_free_chain=temp;
+            file[iter->second].blocks_table[block_num].addr=NULL;
+        }
+    }
+    free(file[iter->second].blocks_table);
+    file[iter->second].blocks_table_size = BLOCK_TABLE_GROW;
+    file[iter->second].blocks_table = (block_info*)calloc(file[iter->second].blocks_table_size,sizeof(union block *));
+    //free(file [iter->second].data);
+    //file [iter->second].data = NULL;
+
 
     fs_stat.free_bytes = fs_stat.free_bytes + file [iter->second].size + sizeof ( file_pair );
     fs_stat.used_bytes = fs_stat.used_bytes - file [iter->second].size - sizeof ( file_pair );
@@ -613,8 +826,20 @@ static int imfs_rmdir(const char *path)
         return -EBUSY;
 
     file [iter->second].inuse = 0;
-    free(file [iter->second].data);
-    file [iter->second].data = NULL;
+    int block_num=0;
+    for (block_num=0;block_num<file[iter->second].blocks_table_size;block_num++){
+        if (file[iter->second].blocks_table[block_num].addr!=NULL){
+            block* temp=file[iter->second].blocks_table[block_num].addr;
+            temp->next=block_free_chain;
+            block_free_chain=temp;
+            file[iter->second].blocks_table[block_num].addr=NULL;
+        }
+    }
+    free(file[iter->second].blocks_table);
+    file[iter->second].blocks_table_size = BLOCK_TABLE_GROW;
+    file[iter->second].blocks_table = (block_info*)calloc(file[iter->second].blocks_table_size,sizeof(union block *));
+//    free(file [iter->second].data);
+//    file [iter->second].data = NULL;
 
     fs_stat.free_bytes = fs_stat.free_bytes + file [iter->second].size + sizeof ( file_pair );
     fs_stat.used_bytes = fs_stat.used_bytes - file [iter->second].size - sizeof ( file_pair );
@@ -672,7 +897,17 @@ static void imfs_destroy (void *tmp)
 {
     for (int i = 0; i < fs_stat.max_no_of_files; i++ )
     {
-        free(file [i].data);
+        int block_num=0;
+        for (block_num=0;block_num<file[i].blocks_table_size;block_num++){
+            if (file[i].blocks_table[block_num].addr!=NULL){
+                block* temp=file[i].blocks_table[block_num].addr;
+                temp->next=block_free_chain;
+                block_free_chain=temp;
+                file[i].blocks_table[block_num].addr=NULL;
+            }
+        }
+        free(file[i].blocks_table);
+//        free(file [i].data);
     }
 
     free(file);
