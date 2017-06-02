@@ -1,14 +1,6 @@
-/*********************************************************
- *
- *        Program implementing an in-memory filesystem
- *            (ie, RAMDISK) using FUSE.
- *
- *********************************************************/
-
-/*................. Include Files .......................*/
-
 #define FUSE_USE_VERSION 26
 
+#include <mpi.h>
 #include <fuse.h>
 #include <cstdio>
 #include <cstring>
@@ -21,20 +13,17 @@
 #include <libgen.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#define NAME_MAX       4096
-#define PATH_MAX       4096*2
+#include <thread>
+#define NAME_MAX       128
+#define PATH_MAX       1024
 #define MSIZE          2
-#define  ROOT          0
+#define ROOT           0
+#define PID_MAX        32768
 
-
-/*............. Global Declarations .................*/
-
-
-/* File system Information */
+int rank, nprocs, provided;
 
 struct fsdata
 {
-
     unsigned long free_bytes;
     unsigned long used_bytes;
     unsigned long total_size;
@@ -42,12 +31,8 @@ struct fsdata
     unsigned long avail_no_of_files;
 };
 
-
-/* File information */
-
 struct metadata
 {
-
     unsigned long inode;
     unsigned long size;
     char *data;
@@ -59,20 +44,51 @@ struct metadata
     gid_t gid;
 };
 
-
-
-/* File information maintained by a directory */
-
-struct list
+const char *command_name[] = {"init", "getattr", "statfs", "utime", "readdir", "open", "read",
+                              "create", "mkdir", "opendir", "release", "write", "rename",
+                              "truncate", "unlink", "rmdir", "destroy", "chmod", "chown"
+                             };
+struct command
 {
-
-    char fname [NAME_MAX];
-    unsigned long inode;
-    struct list *next;
+    enum command_type
+    {
+        init, getattr, statfs, utime, readdir, open, read,
+        create, mkdir, opendir, release, write, rename,
+        truncate, unlink, rmdir, destroy, chmod, chown
+    } type;
+    int source;
+    char path[PATH_MAX];
+    char newpath[PATH_MAX];
+    uid_t uid;
+    gid_t gid;
+    mode_t mode;
+    off_t offset;
+    size_t size;
+    time_t time;
 };
 
+struct request_message
+{
+    enum request_type
+    {
+        get, put
+    } type;
+    int source;
+    int size;
+    char *base;
+};
 
-/* Directory information */
+struct meta_message
+{
+    metadata meta;
+    int status;
+};
+
+struct dir_message
+{
+    size_t size, num;
+    int status;
+};
 
 fsdata fs_stat;
 metadata *file;
@@ -82,13 +98,9 @@ typedef std::pair<path_pair, unsigned long> file_pair;
 typedef std::map<path_pair, unsigned long>::iterator files_iter;
 std::map<path_pair, unsigned long> files;
 
-/*
- ** Function to get directory path and filename relative to the directory.
- */
-
 void get_dirname_filename ( const char *path, char *dir_name, char *base_name )
 {
-    static char tmp1[PATH_MAX], tmp2[NAME_MAX];
+    static char tmp1[PATH_MAX], tmp2[PATH_MAX];
     strcpy(tmp1, path);
     strcpy(tmp2, path);
     char *dir = dirname(tmp1);
@@ -97,7 +109,7 @@ void get_dirname_filename ( const char *path, char *dir_name, char *base_name )
     strcpy(base_name, base);
 }
 
-files_iter find_file(const char * path)
+files_iter find_file(const char *path)
 {
     static char dirname[PATH_MAX], filename[NAME_MAX];
     get_dirname_filename(path, dirname, filename);
@@ -105,18 +117,14 @@ files_iter find_file(const char * path)
     return iter;
 }
 
-void make_file(const char * dirname, const char * filename, unsigned long inode)
+void make_file(const char *dirname, const char *filename, unsigned long inode)
 {
     files[std::make_pair(dirname, filename)] = inode;
 }
-/*
- ** Fill the metadata information for the file when created
- ** Accordingly add an entry into the directory structure.
- */
 
-int fill_file_data(char *dirname, char *fname, mode_t mode)
+int fill_file_data(char *dirname, char *fname, mode_t mode, uid_t uid, gid_t gid)
 {
-    int i;
+    size_t i;
     int size = (int)sizeof(file_pair);
 
     for ( i = 0; i < fs_stat.max_no_of_files; i++ )
@@ -125,25 +133,19 @@ int fill_file_data(char *dirname, char *fname, mode_t mode)
             break;
     }
 
-    /* Fill the metadata info */
-
     file[i].inode = i;
     file[i].size = 0;
     file[i].data = NULL;
     file[i].inuse = 1;
-//    file[i].mode = S_IFREG | 0777;
     file[i].mode = S_IFREG | mode;
     file[i].accesstime = time(NULL);
     file[i].modifiedtime = time(NULL);
-    file[i].uid = fuse_get_context()->uid;
-    file[i].gid = fuse_get_context()->gid;
-
-
-    /* Add an entry into directory */
+    file[i].uid = uid;
+    file[i].gid = gid;
 
     make_file(dirname, fname, i);
     files_iter dir = find_file(dirname);
-    
+
     file [dir->second].accesstime = time(NULL);
     file [dir->second].modifiedtime = time(NULL);
 
@@ -154,15 +156,9 @@ int fill_file_data(char *dirname, char *fname, mode_t mode)
     return 0;
 }
 
-
-/*
- ** Fill the metadata information for the directory when created
- ** Add a directory entry.
- */
-
-int fill_directory_data( char *dirname, char *fname, mode_t mode )
+int fill_directory_data( char *dirname, char *fname, mode_t mode, uid_t uid, gid_t gid )
 {
-    int i;
+    size_t i;
     int file_size = (int) sizeof (file_pair);
 
     for ( i = 0; i < fs_stat.max_no_of_files; i++ )
@@ -171,20 +167,16 @@ int fill_directory_data( char *dirname, char *fname, mode_t mode )
             break;
     }
 
-    /* Fill the metadata info */
-
     file[i].inode = i;
     file[i].size = 0;
     file[i].data = NULL;
     file[i].inuse = 1;
-//    file[i].mode = S_IFDIR | 0777;
     file[i].mode = S_IFDIR | mode;
     file[i].accesstime = time(NULL);
     file[i].modifiedtime = time(NULL);
-    file[i].uid = fuse_get_context()->uid;
-    file[i].gid = fuse_get_context()->gid;
+    file[i].uid = uid;
+    file[i].gid = gid;
 
-    /* Allocate and Populate the directory structure */
     make_file(dirname, fname, i);
     files_iter dir = find_file(dirname);
     file [dir->second].accesstime = time(NULL);
@@ -195,21 +187,16 @@ int fill_directory_data( char *dirname, char *fname, mode_t mode )
     fs_stat.avail_no_of_files--;
 
     return 0;
-
 }
 
-
-
-static void *imfs_init(fuse_conn_info *conn)
+static void server_init(uid_t uid, gid_t gid)
 {
+    static bool flag = false;
 
+    if (flag) return;
+
+    flag = true;
     unsigned long metadata_size;
-
-    /*---------------------------------------------------------
-       Initialize the File System structure.
-
-      Metadata size will be MSIZE percent of total size of FS
-    ----------------------------------------------------------*/
 
     metadata_size = fs_stat.total_size * MSIZE / 100  ;
     fs_stat.max_no_of_files = metadata_size / sizeof ( metadata );
@@ -228,61 +215,80 @@ static void *imfs_init(fuse_conn_info *conn)
     file [ROOT].mode = S_IFDIR | 0777;
     file [ROOT].accesstime = time(NULL);
     file [ROOT].modifiedtime = time(NULL);
-    file [ROOT].uid = fuse_get_context()->uid;
-    file [ROOT].gid = fuse_get_context()->gid;
+    file [ROOT].uid = uid;
+    file [ROOT].gid = gid;
+}
 
+static void *imfs_init(fuse_conn_info *conn)
+{
+    command comm;
+    comm.type = comm.init, comm.source = rank;
+    comm.uid = fuse_get_context()->uid, comm.gid = fuse_get_context()->gid;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
     return 0;
 
 }
 
-static int imfs_getattr(const char *path, struct stat *stbuf)
+static int server_getattr(const char *path)
 {
-
     int index = 0;
-
-    memset(stbuf, 0, sizeof ( struct stat ) );
     files_iter iter = find_file(path);
-
 
     if ( iter == files.end() )
         return -ENOENT;
     else
         index = iter->second;
 
-    if ( S_ISDIR ( file [index].mode ) )
+    return index;
+}
+
+static int imfs_getattr(const char *path, struct stat *stbuf)
+{
+    command comm;
+    comm.type = comm.getattr, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    meta_message message;
+
+    MPI_Recv(&message, sizeof(message), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    if (message.status != 0)
+        return message.status;
+
+    memset(stbuf, 0, sizeof ( struct stat ) );
+
+    if ( S_ISDIR ( message.meta.mode ) )
     {
-        stbuf->st_mode = file [index].mode;
+        stbuf->st_mode = message.meta.mode;
         stbuf->st_nlink = 2;
-        stbuf->st_atime = file [index].accesstime;
-        stbuf->st_mtime = file [index].modifiedtime;
+        stbuf->st_atime = message.meta.accesstime;
+        stbuf->st_mtime = message.meta.modifiedtime;
         stbuf->st_size = 4096;
         stbuf->st_blocks = 4;
         stbuf->st_blksize = 1;
-        stbuf->st_uid = file [index].uid;
-        stbuf->st_gid = file [index].gid;
+        stbuf->st_uid = message.meta.uid;
+        stbuf->st_gid = message.meta.gid;
     }
     else
     {
-        stbuf->st_mode = file [index].mode;
+        stbuf->st_mode = message.meta.mode;
         stbuf->st_nlink = 1;
-        stbuf->st_blocks = file [index].size;
-        stbuf->st_size =  file [index].size;
-        stbuf->st_atime = file [index].accesstime;
-        stbuf->st_mtime = file [index].modifiedtime;
+        stbuf->st_blocks = message.meta.size;
+        stbuf->st_size =  message.meta.size;
+        stbuf->st_atime = message.meta.accesstime;
+        stbuf->st_mtime = message.meta.modifiedtime;
         stbuf->st_blksize = 1;
-        stbuf->st_uid = file [index].uid;
-        stbuf->st_gid = file [index].gid;
+        stbuf->st_uid = message.meta.uid;
+        stbuf->st_gid = message.meta.gid;
     }
 
     return 0;
 }
 
 
-static int imfs_statfs(const char *path, struct statvfs *stbuf)
+static int server_statfs(const char *path, struct statvfs *stbuf)
 {
-
-    int res;
-
     memset(stbuf, 0, sizeof ( struct statvfs ) );
 
     stbuf->f_bsize = 4096;
@@ -297,56 +303,76 @@ static int imfs_statfs(const char *path, struct statvfs *stbuf)
     return 0;
 }
 
-
-int imfs_utime(const char *path, utimbuf *ubuf)
+static int imfs_statfs(const char *path, struct statvfs *stbuf)
 {
-
-    int ret = 0;
-    char dirname[PATH_MAX];
-    char fname [NAME_MAX];
-
-    files_iter iter = find_file(path);
-
-    if ( iter == files.end() )
-        return -ENOENT;
-
-    ubuf->actime = file [iter->second].accesstime;
-    ubuf->modtime = file [iter->second].modifiedtime;
-
-    return ret;
+    command comm;
+    comm.type = comm.statfs, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+    MPI_Recv(stbuf, sizeof(struct statvfs), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return 0;
 }
 
-/* Create a regular file */
-
-static int imfs_create(const char *path, mode_t mode, fuse_file_info *fi)
+static int imfs_utime(const char *path, utimbuf *ubuf)
 {
+    command comm;
+    comm.type = comm.getattr, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
+    meta_message message;
+
+    MPI_Recv(&message, sizeof(message), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    if (message.status != 0)
+        return message.status;
+
+    ubuf->actime = message.meta.accesstime;
+    ubuf->modtime = message.meta.modifiedtime;
+
+    return 0;
+}
+
+static int server_create(const char *path, mode_t mode, uid_t uid, gid_t gid)
+{
     int ret = 0;
     char dirname [PATH_MAX];
     char fname [NAME_MAX];
-    
+
     if ( fs_stat.avail_no_of_files == 0 || fs_stat.free_bytes < sizeof(file_pair) )
         return -ENOSPC;
 
     get_dirname_filename ( path, dirname, fname );
     files_iter iter = find_file(path);
+
     if ( iter != files.end() )
         return -EEXIST;
+
     files_iter dir = find_file(dirname);
+
     if ( dir == files.end() || !S_ISDIR(file[dir->second].mode))
         return -ENOENT;
 
-    ret = fill_file_data( dirname, fname, mode );
+    ret = fill_file_data( dirname, fname, mode, uid, gid );
 
     return ret;
 }
 
-
-/* Create a directory */
-
-static int imfs_mkdir(const char *path, mode_t mode)
+static int imfs_create(const char *path, mode_t mode, fuse_file_info *fi)
 {
+    command comm;
+    comm.type = comm.create, comm.source = rank;
+    comm.uid = fuse_get_context()->uid, comm.gid = fuse_get_context()->gid;
+    strcpy(comm.path, path);
+    comm.mode = mode;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
 
+static int server_mkdir(const char *path, mode_t mode, uid_t uid, gid_t gid)
+{
     char dirname [PATH_MAX];
     char fname [NAME_MAX];
     int ret = 0;
@@ -356,45 +382,79 @@ static int imfs_mkdir(const char *path, mode_t mode)
 
     get_dirname_filename ( path, dirname, fname );
     files_iter iter = find_file(path);
+
     if ( iter != files.end() )
         return -EEXIST;
+
     files_iter dir = find_file(dirname);
+
     if ( dir == files.end() || !S_ISDIR(file[dir->second].mode))
         return -ENOENT;
-    
-    ret = fill_directory_data(dirname, fname, mode);
 
+    ret = fill_directory_data(dirname, fname, mode, uid, gid);
+
+    return ret;
+}
+
+static int imfs_mkdir(const char *path, mode_t mode)
+{
+    command comm;
+    comm.type = comm.mkdir, comm.source = rank;
+    comm.uid = fuse_get_context()->uid, comm.gid = fuse_get_context()->gid;
+    strcpy(comm.path, path);
+    comm.mode = mode;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     return ret;
 
 }
 
-
-static int imfs_open(const char *path, fuse_file_info *fi)
+static int server_open(const char *path)
 {
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
     if (S_ISDIR(file[iter->second].mode))
         return -EISDIR;
+
     file[iter->second].accesstime = time(NULL);
 
     return 0;
 }
 
+static int imfs_open(const char *path, fuse_file_info *fi)
+{
+    command comm;
+    comm.type = comm.open, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
+
 
 static int imfs_release(const char *path, fuse_file_info *fi)
 {
-    return 0;
+    command comm;
+    comm.type = comm.release, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
+    return 0;
 }
 
-static int imfs_truncate(const char *path, off_t offset )
+static int server_truncate(const char *path, off_t offset )
 {
-
     unsigned long old_size = 0;
-    
+
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
@@ -425,11 +485,23 @@ static int imfs_truncate(const char *path, off_t offset )
     return 0;
 }
 
+static int imfs_truncate(const char *path, off_t offset )
+{
+    command comm;
+    comm.type = comm.truncate, comm.source = rank;
+    strcpy(comm.path, path);
+    comm.offset = offset;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
 
-static int imfs_opendir(const char *path, fuse_file_info *fi)
+static int server_opendir(const char *path)
 {
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
@@ -440,60 +512,150 @@ static int imfs_opendir(const char *path, fuse_file_info *fi)
     return 0;
 }
 
+static int imfs_opendir(const char *path, fuse_file_info *fi)
+{
+    command comm;
+    comm.type = comm.opendir, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
 
-static int imfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, fuse_file_info *fi)
+static int server_readdir(const char *path, size_t *&offset, size_t &num, char *&buf, size_t &size)
 {
     char dirname[PATH_MAX];
     char fname [NAME_MAX];
     get_dirname_filename ( path, dirname, fname );
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
     if (!S_ISDIR(file[iter->second].mode))
         return -ENOTDIR;
 
-    filler(buf, ".", NULL, 0);
-    filler(buf, "..", NULL, 0);
-    
-    for(files_iter titer = files.lower_bound(std::make_pair(path, "")); titer != files.end() && titer->first.first == path; titer++)if(titer != iter)
-    {
-        filler(buf, titer->first.second.c_str(), NULL, 0);
-    }
+    num = 2, size = 2 + 3;
+
+    for (files_iter titer = files.lower_bound(std::make_pair(path, "")); titer != files.end() && titer->first.first == path; titer++)if (titer != iter)
+        {
+            num++;
+            size += titer->first.second.length() + 1;
+        }
+
+    offset = new size_t[num];
+    buf = new char[size];
+    size_t len = 0, cur = 0;
+
+    offset[cur++] = len;
+    strcpy(buf + len, ".");
+    len += 2;
+    offset[cur++] = len;
+    strcpy(buf + len, "..");
+    len += 3;
+
+    //filler(buf, ".", NULL, 0);
+    //filler(buf, "..", NULL, 0);
+
+    for (files_iter titer = files.lower_bound(std::make_pair(path, "")); titer != files.end() && titer->first.first == path; titer++)if (titer != iter)
+        {
+            offset[cur++] = len;
+            strcpy(buf + len, titer->first.second.c_str());
+            len += titer->first.second.length() + 1;
+        }
+
     file [iter->second].accesstime = time(NULL);
 
     return 0;
 }
 
-static int imfs_read(const char *path, char *buf, size_t size, off_t offset, fuse_file_info *fi)
+static int imfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, fuse_file_info *fi)
+{
+    command comm;
+    comm.type = comm.readdir, comm.source = rank;
+    strcpy(comm.path, path);
+    comm.offset = offset;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    dir_message message;
+    MPI_Recv(&message, sizeof(message), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    if (message.status < 0)
+        return message.status;
+
+    size_t *tmp_offset = new size_t[message.num];
+    char *tmp_buf = new char[message.size];
+    MPI_Recv(tmp_offset, message.num, MPI_OFFSET, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    MPI_Recv(tmp_buf, message.size, MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    for (size_t i = 0; i < message.num; i++)
+    {
+        filler(buf, tmp_buf + tmp_offset[i], NULL, 0);
+    }
+
+    delete [] tmp_offset;
+    delete [] tmp_buf;
+
+    return 0;
+}
+
+static int server_read(const char *path, size_t size, off_t offset, request_message &request)
 {
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
     if (S_ISDIR(file[iter->second].mode))
         return -EISDIR;
 
-    if ( file[iter->second].data != NULL  &&  ( offset < file[iter->second].size ) )
+    request.source = rank;
+
+    if ( file[iter->second].data != NULL  &&  ( (unsigned long)offset < file[iter->second].size ) )
     {
         if (offset + size > file[iter->second].size )
             size = file[iter->second].size - offset;
 
-        memcpy( buf, file[iter->second].data + offset, size );
+        request.base = file[iter->second].data + offset;
     }
     else
         size = 0;
+
     file[iter->second].accesstime = time(NULL);
 
     return size;
 }
 
-int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fuse_file_info *fi)
+static int imfs_read(const char *path, char *buf, size_t size, off_t offset, fuse_file_info *fi)
+{
+    command comm;
+    comm.type = comm.read, comm.source = rank;
+    strcpy(comm.path, path);
+    comm.offset = offset;
+    comm.size = size;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    request_message request;
+    MPI_Recv(&request, sizeof(request), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    if (request.size <= 0) return request.size;
+
+    int target = request.source;
+    request.source = rank;
+    MPI_Send(&request, sizeof(request), MPI_CHAR, target, 2, MPI_COMM_WORLD);
+    MPI_Recv(buf, request.size, MPI_CHAR, target, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    return request.size;
+}
+
+static int server_write(const char *path, size_t size, off_t offset, request_message &request)
 {
     unsigned long old_size = 0;
 
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
@@ -535,15 +697,39 @@ int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fus
         }
     }
 
-    memcpy(file[iter->second].data + offset, buf, size);
+    request.source = rank;
+    request.base = file[iter->second].data + offset;
     file[iter->second].accesstime = time(NULL);
     file[iter->second].modifiedtime = time(NULL);
     return size;
 }
 
-static int imfs_chmod(const char *path, mode_t mode)
+static int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fuse_file_info *fi)
+{
+    command comm;
+    comm.type = comm.write, comm.source = rank;
+    strcpy(comm.path, path);
+    comm.offset = offset;
+    comm.size = size;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    request_message request;
+    MPI_Recv(&request, sizeof(request), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+    if (request.size <= 0) return request.size;
+
+    int target = request.source;
+    request.source = rank;
+    MPI_Send(&request, sizeof(request), MPI_CHAR, target, 2, MPI_COMM_WORLD);
+    MPI_Send(buf, request.size, MPI_CHAR, target, 3, MPI_COMM_WORLD);
+
+    return request.size;
+}
+
+static int server_chmod(const char *path, mode_t mode)
 {
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
@@ -551,7 +737,35 @@ static int imfs_chmod(const char *path, mode_t mode)
         file[iter->second].mode = S_IFDIR | mode;
     else
         file[iter->second].mode = S_IFREG | mode;
-    
+
+    file[iter->second].accesstime = time(NULL);
+    file[iter->second].modifiedtime = time(NULL);
+
+    return 0;
+}
+static int imfs_chmod(const char *path, mode_t mode)
+{
+    command comm;
+    comm.type = comm.chmod, comm.source = rank;
+    strcpy(comm.path, path);
+    comm.mode = mode;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
+
+static int server_chown(const char *path, uid_t uid, gid_t gid)
+{
+    files_iter iter = find_file(path);
+
+    if ( iter == files.end() )
+        return -ENOENT;
+
+    file[iter->second].uid = uid;
+    file[iter->second].gid = gid;
+
     file[iter->second].accesstime = time(NULL);
     file[iter->second].modifiedtime = time(NULL);
 
@@ -560,22 +774,21 @@ static int imfs_chmod(const char *path, mode_t mode)
 
 static int imfs_chown(const char *path, uid_t uid, gid_t gid)
 {
-    files_iter iter = find_file(path);
-    if ( iter == files.end() )
-        return -ENOENT;
+    command comm;
+    comm.type = comm.chown, comm.source = rank;
+    strcpy(comm.path, path);
+    comm.uid = uid, comm.gid = gid;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
-    file[iter->second].uid = uid;
-    file[iter->second].gid = gid;
-    
-    file[iter->second].accesstime = time(NULL);
-    file[iter->second].modifiedtime = time(NULL);
-
-    return 0;
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
 }
 
-static int imfs_unlink(const char *path)
+static int server_unlink(const char *path)
 {
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
@@ -596,18 +809,27 @@ static int imfs_unlink(const char *path)
     return 0;
 }
 
+static int imfs_unlink(const char *path)
+{
+    command comm;
+    comm.type = comm.unlink, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
-static int imfs_rmdir(const char *path)
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
+
+static int server_rmdir(const char *path)
 {
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
 
     if (!S_ISDIR(file[iter->second].mode))
         return -ENOTDIR;
-//  TODO
-//    if ( dir->ptr != NULL )
-//        return -ENOTEMPTY;
 
     if ( strcmp(path, "/") == 0 )
         return -EBUSY;
@@ -624,33 +846,49 @@ static int imfs_rmdir(const char *path)
     files.erase(iter);
 
     return 0;
-
 }
 
-int imfs_rename(const char *path, const char *newpath)
+static int imfs_rmdir(const char *path)
+{
+    command comm;
+    comm.type = comm.rmdir, comm.source = rank;
+    strcpy(comm.path, path);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
+
+int server_rename(const char *path, const char *newpath)
 {
     char dirname[PATH_MAX];
     char fname [NAME_MAX];
     char newdirname[PATH_MAX];
     char newfname [NAME_MAX];
+
     if ( strcmp(path, "/") == 0 )
         return -EBUSY;
 
     get_dirname_filename ( path, dirname, fname );
     get_dirname_filename ( newpath, newdirname, newfname );
     files_iter iter = find_file(path);
+
     if ( iter == files.end() )
         return -ENOENT;
-    
+
     files_iter dir = find_file(newdirname);
+
     if ( dir == files.end() || !S_ISDIR(file[dir->second].mode))
         return -ENOENT;
 
     make_file(newdirname, newfname, iter->second);
-    if(S_ISDIR(file[iter->second].mode))
+
+    if (S_ISDIR(file[iter->second].mode))
     {
-        int len = strlen(path);
-        for(files_iter iter = files.lower_bound(std::make_pair(path, "")); iter != files.end() && iter->first.first.substr(0, len) == path && (iter->first.first.length() == len || iter->first.first[len] == '/'); iter++)
+        size_t len = strlen(path);
+
+        for (files_iter iter = files.lower_bound(std::make_pair(path, "")); iter != files.end() && iter->first.first.substr(0, len) == path && (iter->first.first.length() == len || iter->first.first[len] == '/'); iter++)
         {
             std::string tmp = std::string(newpath) + iter->first.first.substr(len);
             make_file(tmp.c_str(), iter->first.second.c_str(), iter->second);
@@ -662,15 +900,37 @@ int imfs_rename(const char *path, const char *newpath)
             iter = pre;
         }
     }
+
     files.erase(iter);
 
     return 0;
-
 }
 
-static void imfs_destroy (void *tmp)
+int imfs_rename(const char *path, const char *newpath)
 {
-    for (int i = 0; i < fs_stat.max_no_of_files; i++ )
+    command comm;
+    comm.type = comm.rename, comm.source = rank;
+    strcpy(comm.path, path);
+    strcpy(comm.newpath, newpath);
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    int ret = 0;
+    MPI_Recv(&ret, 1, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return ret;
+}
+
+static void server_destroy ()
+{
+    static bool flag = false;
+
+    if (false) return ;
+
+    flag = true;
+    command comm;
+    comm.type = comm.destroy, comm.source = rank;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+
+    for (size_t i = 0; i < fs_stat.max_no_of_files; i++ )
     {
         free(file [i].data);
     }
@@ -680,10 +940,230 @@ static void imfs_destroy (void *tmp)
     files.clear();
 }
 
+static void imfs_destroy (void *tmp)
+{
+    command comm;
+    comm.type = comm.destroy, comm.source = rank;
+    MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+}
 
+void server_loop()
+{
+    while (true)
+    {
+        command comm;
+        MPI_Recv(&comm, sizeof(comm), MPI_CHAR, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        //if(info[0] == -1 && info[1] == -1)break;
+        //printf("%s, %d\n", command_name[comm.type], comm.source);
+        switch (comm.type)
+        {
+            case command::init:
+            {
+                //printf("\t%d, %d\n", comm.uid, comm.gid);
+                server_init(comm.uid, comm.gid);
+                break;
+            }
+
+            case command::getattr:
+            {
+                //printf("\t%s\n", comm.path);
+                int index = server_getattr(comm.path);
+                meta_message message;
+
+                if (index < 0)
+                    message.status = index;
+                else
+                {
+                    message.status = 0;
+                    message.meta = file[index];
+                }
+
+                MPI_Send(&message, sizeof(message), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::statfs:
+            {
+                //printf("\t%s\n", comm.path);
+                struct statvfs stbuf;
+                server_statfs(comm.path, &stbuf);
+                MPI_Send(&stbuf, sizeof(stbuf), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::create:
+            {
+                //printf("\t%s, %d, %d, %d\n", comm.path, comm.mode, comm.uid, comm.gid);
+                int ret = server_create(comm.path, comm.mode, comm.uid, comm.gid);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::mkdir:
+            {
+                //printf("\t%s, %d, %d, %d\n", comm.path, comm.mode, comm.uid, comm.gid);
+                int ret = server_mkdir(comm.path, comm.mode, comm.uid, comm.gid);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::open:
+            {
+                //printf("\t%s\n", comm.path);
+                int ret = server_open(comm.path);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::truncate:
+            {
+                //printf("\t%s, %ld\n", comm.path, comm.offset);
+                int ret = server_truncate(comm.path, comm.offset);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::opendir:
+            {
+                //printf("\t%s\n", comm.path);
+                int ret = server_opendir(comm.path);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::readdir:
+            {
+                //printf("\t%s, %ld\n", comm.path, comm.offset);
+                size_t num, size, *offset;
+                char *buf;
+                int ret = server_readdir(comm.path, offset, num, buf, size);
+                dir_message message;
+
+                if (ret < 0)
+                {
+                    message.status = ret;
+                    MPI_Send(&message, sizeof(message), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                }
+                else
+                {
+                    message.status = ret;
+                    message.num = num;
+                    message.size = size;
+                    MPI_Send(&message, sizeof(message), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                    MPI_Send(offset, num, MPI_OFFSET, comm.source, 1, MPI_COMM_WORLD);
+                    MPI_Send(buf, size, MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                    delete [] offset;
+                    delete [] buf;
+                }
+
+                break;
+            }
+
+            case command::read:
+            {
+                //printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
+                request_message request;
+                int ret = server_read(comm.path, comm.size, comm.offset, request);
+                request.size = ret;
+                request.type = request.get;
+                MPI_Send(&request, sizeof(request), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::write:
+            {
+                //printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
+                request_message request;
+                int ret = server_write(comm.path, comm.size, comm.offset, request);
+                request.size = ret;
+                request.type = request.put;
+                MPI_Send(&request, sizeof(request), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::unlink:
+            {
+                //printf("\t%s\n", comm.path);
+                int ret = server_unlink(comm.path);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::rmdir:
+            {
+                //printf("\t%s\n", comm.path);
+                int ret = server_rmdir(comm.path);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::chmod:
+            {
+                //printf("\t%s, %d\n", comm.path, comm.mode);
+                int ret = server_chmod(comm.path, comm.mode);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::chown:
+            {
+                //printf("\t%s, %d, %d\n", comm.path, comm.uid, comm.gid);
+                int ret = server_chown(comm.path, comm.uid, comm.gid);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::rename:
+            {
+                //printf("\t%s, %s\n", comm.path, comm.newpath);
+                int ret = server_rename(comm.path, comm.newpath);
+                MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
+                break;
+            }
+
+            case command::destroy:
+                break;
+
+            case command::release:
+                //printf("\t%s\n", comm.path);
+                break;
+
+            case command::utime:
+                break;
+        }
+
+        //MPI_Send(a+info[0], 1, MPI_INT, info[1], 1, MPI_COMM_WORLD);
+    }
+}
+
+void monitor_loop()
+{
+    while (true)
+    {
+        request_message request;
+        MPI_Recv(&request, sizeof(request), MPI_CHAR, MPI_ANY_SOURCE, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        //if(info[0] == -1 && info[1] == -1)break;
+        if (request.type == request.get)
+            MPI_Send(request.base, request.size, MPI_CHAR, request.source, 3, MPI_COMM_WORLD);
+        else
+            MPI_Recv(request.base, request.size, MPI_CHAR, request.source, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+}
 
 int main(int argc, char *argv[])
 {
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+    printf("%d %d\n", rank, nprocs);
+
+    if (provided != MPI_THREAD_MULTIPLE)
+    {
+        printf("MPI do not Support Multiple thread\n");
+        exit(0);
+    }
 
     int size;
     int i = 2;
@@ -735,5 +1215,15 @@ int main(int argc, char *argv[])
 //    .access, .readlink, .mknod, .symlink,
 //    .link, .chown, .release, .fsync
 
-    return fuse_main(argc, argv, &imfs_oper, NULL);
+    if (rank == 0)
+    {
+        std::thread monitor(monitor_loop);
+        server_loop();
+    }
+    else
+        fuse_main(argc, argv, &imfs_oper, NULL);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Finalize();
+    return 0;
 }
