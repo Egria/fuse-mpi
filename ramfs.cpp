@@ -736,6 +736,7 @@ static void server_read(command &comm)
     if (blkoff != 0) {
         int rs = (nblks != 0) ? (BLOCK_SIZE - blkoff) : (endpos - offset);
         request.source = table[blkno].rank;
+        request.base = (char *)&((table[blkno].addr + blkoff)->data);
         request.size = rs;
         SEND_MPI;
         blkno++, nblks--;
@@ -745,6 +746,7 @@ static void server_read(command &comm)
     request.size = BLOCK_SIZE;
     while (nblks != 0) {
         request.source = table[blkno].rank;
+        request.base = (char *)&(table[blkno].addr->data);;
         SEND_MPI;
         blkno++, nblks--;
     }
@@ -752,6 +754,7 @@ static void server_read(command &comm)
     request.size = endpos % BLOCK_SIZE;
     if (request.size != 0) {
         request.source = table[blkno].rank;
+        request.base = (char *)&(table[blkno].addr->data);;
         SEND_MPI;
     }
 
@@ -781,64 +784,111 @@ static int imfs_read(const char *path, char *buf, size_t size, off_t offset, fus
         request.source = rank;
         MPI_Send(&request, sizeof(request), MPI_CHAR, target, 2, MPI_COMM_WORLD);
         MPI_Recv(buf, request.size, MPI_CHAR, target, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        buf += request.size;
         total += request.size;
     }
 
     return total;
 }
 
-static int server_write(const char *path, size_t size, off_t offset, request_message &request)
+static block *server_request_block(command &comm)
 {
-    unsigned long old_size = 0;
+#define SEND_MPI MPI_Send(&request, sizeof(request), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+    request_message request;
+    request.end = false;
+    request.size = BLOCK_SIZE;
+    request.base = NULL;
+    SEND_MPI;
+    MPI_Recv(&request, sizeof(request), MPI_CHAR, comm.source, 10, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    return (block *)request.base;
+}
 
-    files_iter iter = find_file(path);
+static void server_write(command &comm)
+{
+    request_message request;
 
-    if ( iter == files.end() )
-        return -ENOENT;
-
-    if (S_ISDIR(file[iter->second].mode))
-        return -EISDIR;
-
-    //if ( file [iter->second].data == NULL )
-    {
-        if ( fs_stat.free_bytes < size )
-            return -ENOSPC;
-
-        //file [iter->second].data = (char *) malloc( offset + size);
-
-        //if ( file [iter->second].data == NULL )
-        {
-            perror("malloc:");
-            return -ENOMEM;
-        }
-
-        //memset(file [iter->second].data, 0, offset + size);
-        file [iter->second].size = offset + size;
-        fs_stat.free_bytes = fs_stat.free_bytes - (offset + size);
-        fs_stat.used_bytes = fs_stat.used_bytes + offset + size;
-    }
-    //else
-    {
-
-        old_size = file [iter->second].size;
-
-        if ( (offset + size) > file[iter->second].size )
-        {
-            if ( fs_stat.free_bytes < ( offset + size - old_size ) )
-                return -ENOSPC;
-
-            //file [iter->second].data = (char *) realloc( file[iter->second].data, (offset + size) );
-            fs_stat.free_bytes = fs_stat.free_bytes + old_size - ( offset + size );
-            fs_stat.used_bytes = fs_stat.used_bytes - old_size + ( offset + size );
-            file [iter->second].size = offset + size;
-        }
+    files_iter iter = find_file(comm.path);
+    if (iter == files.end()) {
+        request.end = true;
+        request.size = -ENOENT;
+        SEND_MPI; return;
     }
 
-    request.source = rank;
-    //request.base = file[iter->second].data + offset;
+    if (S_ISDIR(file[iter->second].mode)) {
+        request.end = true;
+        request.size = -EISDIR;
+        SEND_MPI; return;
+    }
+
+    int offset = comm.offset, size = comm.size;
+
     file[iter->second].accesstime = time(NULL);
     file[iter->second].modifiedtime = time(NULL);
-    return size;
+
+    int old_size = file[iter->second].size;
+    block_info *table = file[iter->second].blocks_table;
+
+    if ((offset + size) > file[iter->second].size) {
+        if (fs_stat.free_bytes < (offset + size - old_size)) {
+            request.end = true;
+            request.size = -ENOSPC;
+            SEND_MPI; return;
+        }
+        file[iter->second].blocks_table = table =
+                resize_block_table(table, old_size, offset + size);
+        fs_stat.free_bytes = fs_stat.free_bytes + old_size - (offset + size);
+        fs_stat.used_bytes = fs_stat.used_bytes - old_size + (offset + size);
+        file[iter->second].size = offset + size;
+    }
+
+    int endpos = offset + size;
+    int blkno = offset / BLOCK_SIZE;          // The NO. of rd begin block
+    int nblks = endpos / BLOCK_SIZE - blkno;  // The size of rd blocks
+
+    request.type = request.put;
+    request.end = false;
+    int blkoff = offset % BLOCK_SIZE;
+    if (blkoff != 0) {
+        int rs = (nblks != 0) ? (BLOCK_SIZE - blkoff) : (endpos - offset);
+        if (table[blkno].addr == NULL) {
+            table[blkno].addr = server_request_block(comm);
+            table[blkno].rank = comm.source;
+        }
+        request.source = table[blkno].rank;
+        request.base = (char *)&((table[blkno].addr + blkoff)->data);
+        request.size = rs;
+        SEND_MPI;
+        blkno++, nblks--;
+    }
+    if (nblks + 1 == 0) goto out;
+
+    request.size = BLOCK_SIZE;
+    while (nblks != 0) {
+        if (table[blkno].addr == NULL) {
+            table[blkno].addr = server_request_block(comm);
+            table[blkno].rank = comm.source;
+        }
+        request.source = table[blkno].rank;
+        request.base = (char *)&(table[blkno].addr->data);
+        SEND_MPI;
+        blkno++, nblks--;
+    }
+
+    request.size = endpos % BLOCK_SIZE;
+    if (request.size != 0) {
+        if (table[blkno].addr == NULL) {
+            table[blkno].addr = server_request_block(comm);
+            table[blkno].rank = comm.source;
+        }
+        request.source = table[blkno].rank;
+        request.base = (char *)&(table[blkno].addr->data);
+        SEND_MPI;
+    }
+
+out:
+    request.end = true;
+    SEND_MPI;
+#undef SEND_MPI
 }
 
 static int imfs_write(const char *path, const char *buf, size_t size, off_t offset, fuse_file_info *fi)
@@ -851,16 +901,28 @@ static int imfs_write(const char *path, const char *buf, size_t size, off_t offs
     MPI_Send(&comm, sizeof(comm), MPI_CHAR, 0, 0, MPI_COMM_WORLD);
 
     request_message request;
-    MPI_Recv(&request, sizeof(request), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    int total = 0;
 
-    if (request.size <= 0) return request.size;
+    for (; ; ) {
+        MPI_Recv(&request, sizeof(request), MPI_CHAR, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        if (request.size < 0) return request.size;
+        if (request.end) break;
+        if (request.base == NULL) {
+            // memory allocation
+            request.base = (char *)alloc_block();
+            MPI_Send(&request, sizeof(request), MPI_CHAR, 0,
+                        10, MPI_COMM_WORLD);
+            continue;
+        }
+        int target = request.source;
+        request.source = rank;
+        MPI_Send(&request, sizeof(request), MPI_CHAR, target, 2, MPI_COMM_WORLD);
+        MPI_Send(buf, request.size, MPI_CHAR, target, 3, MPI_COMM_WORLD);
+        buf += request.size;
+        total += request.size;
+    }
 
-    int target = request.source;
-    request.source = rank;
-    MPI_Send(&request, sizeof(request), MPI_CHAR, target, 2, MPI_COMM_WORLD);
-    MPI_Send(buf, request.size, MPI_CHAR, target, 3, MPI_COMM_WORLD);
-
-    return request.size;
+    return total;
 }
 
 static int server_chmod(const char *path, mode_t mode)
@@ -934,6 +996,7 @@ static int server_unlink(const char *path)
 
 
     file [iter->second].inuse = 0;
+    // TODO
     //free(file [iter->second].data);
     //file [iter->second].data = NULL;
 
@@ -972,8 +1035,8 @@ static int server_rmdir(const char *path)
         return -EBUSY;
 
     file [iter->second].inuse = 0;
-    //free(file [iter->second].data);
-    //file [iter->second].data = NULL;
+    free(file [iter->second].data);
+    file [iter->second].data = NULL;
 
     fs_stat.free_bytes = fs_stat.free_bytes + file [iter->second].size + sizeof ( file_pair );
     fs_stat.used_bytes = fs_stat.used_bytes - file [iter->second].size - sizeof ( file_pair );
@@ -1207,11 +1270,7 @@ void server_loop()
             case command::write:
             {
                 //printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
-                request_message request;
-                int ret = server_write(comm.path, comm.size, comm.offset, request);
-                request.size = ret;
-                request.type = request.put;
-                MPI_Send(&request, sizeof(request), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
+                server_write(comm);
                 break;
             }
 
