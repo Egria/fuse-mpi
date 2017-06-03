@@ -23,6 +23,8 @@
 #define BLOCK_SIZE     (128 * 1024)
 #define BLOCK_TABLE_GROW (1024 * 1024)
 #define BLOCK_POOL_GROW  (1024)
+#define MPI_Recv printf("MPI_Recv! %d: %s\n", __LINE__, __FUNCTION__); MPI_Recv
+#define MPI_Send printf("MPI_Send! %d: %s\n", __LINE__, __FUNCTION__); MPI_Send
 
 int rank, nprocs, provided;
 
@@ -133,7 +135,7 @@ inline union block *alloc_block()
     } else {
         if (block_continuous_pool_size <= 0) {
             block_continuous_pool = (union block *)malloc(BLOCK_POOL_GROW *
-	            sizeof(union block *));
+	            sizeof(union block));
             block_continuous_pool_size = BLOCK_POOL_GROW;
         }
         ret = block_continuous_pool;
@@ -157,14 +159,13 @@ inline block_info *resize_block_table(block_info *table,
     size_t orig_grows = orig_size / BLOCK_TABLE_GROW + 1;
     size_t required_grows = size / BLOCK_TABLE_GROW + 1;
 
-    if (required_grows == orig_grows) return table;
-
     block_info *ret;
     if (table == NULL) {
         orig_grows = 0;
         ret = (block_info *)malloc(required_grows * BLOCK_TABLE_GROW *
                 sizeof(block_info));
     } else {
+        if (required_grows == orig_grows) return table;
         ret = (block_info *)realloc(table, required_grows *
                 BLOCK_TABLE_GROW * sizeof(block_info));
     }
@@ -922,6 +923,7 @@ static int imfs_write(const char *path, const char *buf, size_t size, off_t offs
         total += request.size;
     }
 
+    printf("ending write\n");
     return total;
 }
 
@@ -1337,10 +1339,11 @@ void monitor_loop()
         MPI_Recv(&request, sizeof(request), MPI_CHAR, MPI_ANY_SOURCE, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
         //if(info[0] == -1 && info[1] == -1)break;
-        if (request.type == request.get)
+        if (request.type == request.get) {
             MPI_Send(request.base, request.size, MPI_CHAR, request.source, 3, MPI_COMM_WORLD);
-        else
+        } else {
             MPI_Recv(request.base, request.size, MPI_CHAR, request.source, 3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        }
     }
 }
 
@@ -1407,13 +1410,12 @@ int main(int argc, char *argv[])
 //    .access, .readlink, .mknod, .symlink,
 //    .link, .chown, .release, .fsync
 
-    if (rank == 0)
-    {
-        std::thread monitor(monitor_loop);
+    std::thread monitor(monitor_loop);
+    if (rank == 0) {
         server_loop();
-    }
-    else
+    } else {
         fuse_main(argc, argv, &imfs_oper, NULL);
+    }
 
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
