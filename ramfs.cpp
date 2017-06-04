@@ -144,13 +144,6 @@ inline union block *alloc_block()
     return ret;
 }
 
-inline void free_block(union block *b)
-{
-    if (b == NULL) return;
-    b->next = block_free_chain;
-    block_free_chain = b;
-}
-
 inline block_info *resize_block_table(block_info *table,
         size_t orig_size, size_t size)
 {
@@ -545,10 +538,6 @@ static int server_truncate(const char *path, off_t offset )
 
     if ( offset == 0 )
     {
-        for (int idx = 0; idx < file[iter->second].blocks_table_size; idx++) {
-            if (file[iter->second].blocks_table[idx].addr)
-                free_block(file[iter->second].blocks_table[idx].addr);
-        }
         free(file[iter->second].blocks_table);
         file[iter->second].blocks_table = NULL;
         file[iter->second].blocks_table_size = 0;
@@ -562,8 +551,6 @@ static int server_truncate(const char *path, off_t offset )
         int new_size = block_id + 1;
         for (int idx = new_size;
                 idx < file[iter->second].blocks_table_size; idx++) {
-            if (file[iter->second].blocks_table[idx].addr)
-                free_block(file[iter->second].blocks_table[idx].addr);
             file[iter->second].blocks_table[idx].addr = NULL;
         }
         file[iter->second].blocks_table = resize_block_table(
@@ -1000,10 +987,6 @@ static int server_unlink(const char *path)
 
 
     file [iter->second].inuse = 0;
-    // TODO
-    //free(file [iter->second].data);
-    //file [iter->second].data = NULL;
-
     fs_stat.free_bytes = fs_stat.free_bytes + file [iter->second].size + sizeof ( file_pair );
     fs_stat.used_bytes = fs_stat.used_bytes - file [iter->second].size - sizeof ( file_pair );
     fs_stat.avail_no_of_files++;
