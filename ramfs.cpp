@@ -20,7 +20,7 @@
 #define MSIZE          2
 #define ROOT           0
 #define PID_MAX        32768
-#define BLOCK_SIZE     (128 * 1024)
+#define BLOCK_SIZE     (1*1024 * 1024)
 #define BLOCK_TABLE_GROW (1024 * 1024)
 #define BLOCK_POOL_GROW  (1024)
 
@@ -366,12 +366,12 @@ static int server_statfs(const char *path, struct statvfs *stbuf)
 
     stbuf->f_bsize = BLOCK_SIZE;
     stbuf->f_frsize = BLOCK_SIZE;
-    stbuf->f_blocks = fs_stat.total_size;
-    stbuf->f_bfree = fs_stat.free_bytes;
+    stbuf->f_blocks = fs_stat.total_size/BLOCK_SIZE;
+    stbuf->f_bfree = fs_stat.free_bytes/BLOCK_SIZE;
     stbuf->f_files = fs_stat.max_no_of_files;
     stbuf->f_ffree = fs_stat.avail_no_of_files;
     stbuf->f_namemax = NAME_MAX;
-    stbuf->f_bavail = fs_stat.free_bytes;
+    stbuf->f_bavail = fs_stat.free_bytes/BLOCK_SIZE;
 
     return 0;
 }
@@ -1345,7 +1345,6 @@ int main(int argc, char *argv[])
         exit(0);
     }
 
-    int size;
     int i = 2;
 
     if ( argc < 3 )
@@ -1354,9 +1353,9 @@ int main(int argc, char *argv[])
         exit(-1);
     }
 
-    size = atoi(argv[2]);
+    unsigned long size = atol(argv[2]);
 
-    fs_stat.total_size = size * 1024 * 1024; /* In bytes */
+    fs_stat.total_size = size * 1024 * 1024 * nprocs; /* In bytes */
 
     char tmp[1024];
 
