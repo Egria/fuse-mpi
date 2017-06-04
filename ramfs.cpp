@@ -371,8 +371,8 @@ static int server_statfs(const char *path, struct statvfs *stbuf)
 {
     memset(stbuf, 0, sizeof ( struct statvfs ) );
 
-    stbuf->f_bsize = 4096;
-    stbuf->f_frsize = 4096;
+    stbuf->f_bsize = BLOCK_SIZE;
+    stbuf->f_frsize = BLOCK_SIZE;
     stbuf->f_blocks = fs_stat.total_size;
     stbuf->f_bfree = fs_stat.free_bytes;
     stbuf->f_files = fs_stat.max_no_of_files;
@@ -835,8 +835,10 @@ static void server_write(command &comm)
             request.size = -ENOSPC;
             SEND_MPI; return;
         }
+        int old_block_size = file[iter->second].blocks_table_size;
+        int new_block_size = ((offset + size + 1) / BLOCK_SIZE) + 1;
         file[iter->second].blocks_table = table =
-                resize_block_table(table, old_size, offset + size);
+                resize_block_table(table, old_block_size, new_block_size);
         fs_stat.free_bytes = fs_stat.free_bytes + old_size - (offset + size);
         fs_stat.used_bytes = fs_stat.used_bytes - old_size + (offset + size);
         file[iter->second].size = offset + size;
