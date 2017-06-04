@@ -23,8 +23,6 @@
 #define BLOCK_SIZE     (128 * 1024)
 #define BLOCK_TABLE_GROW (1024 * 1024)
 #define BLOCK_POOL_GROW  (1024)
-#define MPI_Recv printf("MPI_Recv! %d: %s\n", __LINE__, __FUNCTION__); MPI_Recv
-#define MPI_Send printf("MPI_Send! %d: %s\n", __LINE__, __FUNCTION__); MPI_Send
 
 int rank, nprocs, provided;
 
@@ -170,9 +168,11 @@ inline block_info *resize_block_table(block_info *table,
                 BLOCK_TABLE_GROW * sizeof(block_info));
     }
 
-    if (required_grows > orig_grows)
-        memset(ret + orig_grows * (BLOCK_TABLE_GROW/BLOCK_SIZE), 0, (required_grows - orig_grows) *
+    if (required_grows > orig_grows) {
+        memset(ret + orig_grows * BLOCK_TABLE_GROW,
+                0, (required_grows - orig_grows) *
                 BLOCK_TABLE_GROW * sizeof(block_info));
+    }
 
     return ret;
 }
@@ -923,7 +923,7 @@ static int imfs_write(const char *path, const char *buf, size_t size, off_t offs
         total += request.size;
     }
 
-    printf("ending write\n");
+    //printf("ending write\n");
     return total;
 }
 
@@ -1157,19 +1157,19 @@ void server_loop()
         MPI_Recv(&comm, sizeof(comm), MPI_CHAR, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
         //if(info[0] == -1 && info[1] == -1)break;
-        printf("%s, %d\n", command_name[comm.type], comm.source);
+        //printf("%s, %d\n", command_name[comm.type], comm.source);
         switch (comm.type)
         {
             case command::init:
             {
-                printf("\t%d, %d\n", comm.uid, comm.gid);
+                //printf("\t%d, %d\n", comm.uid, comm.gid);
                 server_init(comm.uid, comm.gid);
                 break;
             }
 
             case command::getattr:
             {
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 int index = server_getattr(comm.path);
                 meta_message message;
 
@@ -1187,7 +1187,7 @@ void server_loop()
 
             case command::statfs:
             {
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 struct statvfs stbuf;
                 server_statfs(comm.path, &stbuf);
                 MPI_Send(&stbuf, sizeof(stbuf), MPI_CHAR, comm.source, 1, MPI_COMM_WORLD);
@@ -1196,7 +1196,7 @@ void server_loop()
 
             case command::create:
             {
-                printf("\t%s, %d, %d, %d\n", comm.path, comm.mode, comm.uid, comm.gid);
+                //printf("\t%s, %d, %d, %d\n", comm.path, comm.mode, comm.uid, comm.gid);
                 int ret = server_create(comm.path, comm.mode, comm.uid, comm.gid);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1204,7 +1204,7 @@ void server_loop()
 
             case command::mkdir:
             {
-                printf("\t%s, %d, %d, %d\n", comm.path, comm.mode, comm.uid, comm.gid);
+                //printf("\t%s, %d, %d, %d\n", comm.path, comm.mode, comm.uid, comm.gid);
                 int ret = server_mkdir(comm.path, comm.mode, comm.uid, comm.gid);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1212,7 +1212,7 @@ void server_loop()
 
             case command::open:
             {
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 int ret = server_open(comm.path);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1220,7 +1220,7 @@ void server_loop()
 
             case command::truncate:
             {
-                printf("\t%s, %ld\n", comm.path, comm.offset);
+                //printf("\t%s, %ld\n", comm.path, comm.offset);
                 int ret = server_truncate(comm.path, comm.offset);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1228,7 +1228,7 @@ void server_loop()
 
             case command::opendir:
             {
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 int ret = server_opendir(comm.path);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1236,7 +1236,7 @@ void server_loop()
 
             case command::readdir:
             {
-                printf("\t%s, %ld\n", comm.path, comm.offset);
+                //printf("\t%s, %ld\n", comm.path, comm.offset);
                 size_t num, size, *offset;
                 char *buf;
                 int ret = server_readdir(comm.path, offset, num, buf, size);
@@ -1264,21 +1264,21 @@ void server_loop()
 
             case command::read:
             {
-                printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
+                //printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
                 server_read(comm);
                 break;
             }
 
             case command::write:
             {
-                printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
+                //printf("\t%s, %ld, %ld\n", comm.path, comm.offset, comm.size);
                 server_write(comm);
                 break;
             }
 
             case command::unlink:
             {
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 int ret = server_unlink(comm.path);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1286,7 +1286,7 @@ void server_loop()
 
             case command::rmdir:
             {
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 int ret = server_rmdir(comm.path);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1294,7 +1294,7 @@ void server_loop()
 
             case command::chmod:
             {
-                printf("\t%s, %d\n", comm.path, comm.mode);
+                //printf("\t%s, %d\n", comm.path, comm.mode);
                 int ret = server_chmod(comm.path, comm.mode);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1302,7 +1302,7 @@ void server_loop()
 
             case command::chown:
             {
-                printf("\t%s, %d, %d\n", comm.path, comm.uid, comm.gid);
+                //printf("\t%s, %d, %d\n", comm.path, comm.uid, comm.gid);
                 int ret = server_chown(comm.path, comm.uid, comm.gid);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1310,7 +1310,7 @@ void server_loop()
 
             case command::rename:
             {
-                printf("\t%s, %s\n", comm.path, comm.newpath);
+                //printf("\t%s, %s\n", comm.path, comm.newpath);
                 int ret = server_rename(comm.path, comm.newpath);
                 MPI_Send(&ret, 1, MPI_INT, comm.source, 1, MPI_COMM_WORLD);
                 break;
@@ -1320,7 +1320,7 @@ void server_loop()
                 break;
 
             case command::release:
-                printf("\t%s\n", comm.path);
+                //printf("\t%s\n", comm.path);
                 break;
 
             case command::utime:
@@ -1352,11 +1352,11 @@ int main(int argc, char *argv[])
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
-    printf("%d %d\n", rank, nprocs);
+    //printf("%d %d\n", rank, nprocs);
 
     if (provided != MPI_THREAD_MULTIPLE)
     {
-        printf("MPI do not Support Multiple thread\n");
+        //printf("MPI do not Support Multiple thread\n");
         exit(0);
     }
 
@@ -1365,7 +1365,7 @@ int main(int argc, char *argv[])
 
     if ( argc < 3 )
     {
-        printf("%s <mountpoint> <size in (MB)>\n", argv[0]);
+        //printf("%s <mountpoint> <size in (MB)>\n", argv[0]);
         exit(-1);
     }
 
