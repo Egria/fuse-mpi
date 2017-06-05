@@ -99,7 +99,7 @@ struct request_message
         get, put
     } type;
     int source;
-    int size;
+    long long size;
     char *base;
     bool end;
 };
@@ -726,16 +726,16 @@ static void server_read(command &comm)
         SEND_MPI; return;
     }
 
-    int offset = comm.offset, size = comm.size;
-    int endpos = offset + size;
-    int blkno = offset / BLOCK_SIZE;          // The NO. of rd begin block
-    int nblks = endpos / BLOCK_SIZE - blkno;  // The size of rd blocks
+    long long offset = comm.offset, size = comm.size;
+    long long endpos = offset + size;
+    long long blkno = offset / BLOCK_SIZE;          // The NO. of rd begin block
+    long long nblks = endpos / BLOCK_SIZE - blkno;  // The size of rd blocks
 
     request.type = request.get;
     request.end = false;
-    int blkoff = offset % BLOCK_SIZE;
+    long long blkoff = offset % BLOCK_SIZE;
     if (blkoff != 0) {
-        int rs = (nblks != 0) ? (BLOCK_SIZE - blkoff) : (endpos - offset);
+        long long rs = (nblks != 0) ? (BLOCK_SIZE - blkoff) : (endpos - offset);
         request.source = table[blkno].rank;
         request.base = (char *)&(table[blkno].addr->data) + blkoff;
         request.size = rs;
@@ -821,12 +821,12 @@ static void server_write(command &comm)
         SEND_MPI; return;
     }
 
-    int offset = comm.offset, size = comm.size;
+    long long offset = comm.offset, size = comm.size;
 
     file[iter->second].accesstime = time(NULL);
     file[iter->second].modifiedtime = time(NULL);
 
-    int old_size = file[iter->second].size;
+    long long old_size = file[iter->second].size;
     block_info *table = file[iter->second].blocks_table;
 
     if ((offset + size) > file[iter->second].size) {
@@ -835,8 +835,8 @@ static void server_write(command &comm)
             request.size = -ENOSPC;
             SEND_MPI; return;
         }
-        int old_block_size = file[iter->second].blocks_table_size;
-        int new_block_size = ((offset + size + 1) / BLOCK_SIZE) + 1;
+        long long old_block_size = file[iter->second].blocks_table_size;
+        long long new_block_size = ((offset + size + 1) / BLOCK_SIZE) + 1;
         file[iter->second].blocks_table = table =
                 resize_block_table(table, old_block_size, new_block_size);
         fs_stat.free_bytes = fs_stat.free_bytes + old_size - (offset + size);
@@ -844,15 +844,15 @@ static void server_write(command &comm)
         file[iter->second].size = offset + size;
     }
 
-    int endpos = offset + size;
-    int blkno = offset / BLOCK_SIZE;          // The NO. of rd begin block
-    int nblks = endpos / BLOCK_SIZE - blkno;  // The size of rd blocks
+    long long endpos = offset + size;
+    long long blkno = offset / BLOCK_SIZE;          // The NO. of rd begin block
+    long long nblks = endpos / BLOCK_SIZE - blkno;  // The size of rd blocks
 
     request.type = request.put;
     request.end = false;
-    int blkoff = offset % BLOCK_SIZE;
+    long long blkoff = offset % BLOCK_SIZE;
     if (blkoff != 0) {
-        int rs = (nblks != 0) ? (BLOCK_SIZE - blkoff) : (endpos - offset);
+        long long rs = (nblks != 0) ? (BLOCK_SIZE - blkoff) : (endpos - offset);
         if (table[blkno].addr == NULL) {
             table[blkno].addr = server_request_block(comm);
             table[blkno].rank = comm.source;
